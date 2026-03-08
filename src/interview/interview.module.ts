@@ -25,6 +25,10 @@ import {
   UserTransaction,
   UserTransactionSchema,
 } from '../user/schemas/user-transaction.schema';
+import {
+  ResumeRecord,
+  ResumeRecordSchema,
+} from '../resume/schemas/resume-record.schema';
 
 @Module({
   imports: [
@@ -36,6 +40,7 @@ import {
       { name: User.name, schema: UserSchema },
       { name: AIInterviewResult.name, schema: AIInterviewResultSchema },
       { name: UserTransaction.name, schema: UserTransactionSchema },
+      { name: ResumeRecord.name, schema: ResumeRecordSchema },
     ]),
   ],
   controllers: [InterviewController],

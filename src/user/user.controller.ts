@@ -75,4 +75,23 @@ export class UserController {
     });
     return ResponseUtil.success(result, '获取成功');
   }
+
+  @Get('transactions')
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({
+    summary: '获取用户交易记录',
+    description: '获取用户充值或账户流水记录',
+  })
+  async getUserTransactions(
+    @Request() req: any,
+    @Query('skip') skip: number = 0,
+    @Query('limit') limit: number = 20,
+  ) {
+    const { userId } = req.user;
+    const result = await this.userService.getUserTransactions(userId, {
+      skip,
+      limit,
+    });
+    return ResponseUtil.success(result, '获取成功');
+  }
 }

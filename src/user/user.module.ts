@@ -11,6 +11,10 @@ import {
   UserConsumption,
   UserConsumptionSchema,
 } from './schemas/consumption-record.schema';
+import {
+  UserTransaction,
+  UserTransactionSchema,
+} from './schemas/user-transaction.schema';
 
 @Module({
   imports: [
@@ -18,6 +22,7 @@ import {
       { name: User.name, schema: UserSchema },
       { name: ConsumptionRecord.name, schema: ConsumptionRecordSchema },
       { name: UserConsumption.name, schema: UserConsumptionSchema },
+      { name: UserTransaction.name, schema: UserTransactionSchema },
     ]),
   ], // 引入数据库模块
   controllers: [UserController],

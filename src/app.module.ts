@@ -20,16 +20,20 @@ import { getTokenExpirationSeconds } from './common/utils/jwt.util';
 import { TraceIdMiddleware } from './common/middleware/trace-id.middleware';
 import { MetricsInterceptor } from './common/interceptors/metrics.interceptor';
 import { MetricsModule } from './common/metrics/metrics.module';
+import { resolveMongoUri } from './common/mongo/embedded-mongo';
+import { ResumeModule } from './resume/resume.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
-      envFilePath: '.env.development',
+      envFilePath: ['.env.local', '.env.development', '.env.production', '.env'],
       isGlobal: true,
     }),
-    MongooseModule.forRoot(
-      process.env.MONGODB_URI || 'mongodb://localhost:27017/wwzhidao',
-    ),
+    MongooseModule.forRootAsync({
+      useFactory: async () => ({
+        uri: await resolveMongoUri(),
+      }),
+    }),
     WinstonModule.forRoot({
       format: winston.format.combine(
         winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
@@ -60,6 +64,7 @@ import { MetricsModule } from './common/metrics/metrics.module';
     WechatModule,
     PaymentModule,
     StsModule,
+    ResumeModule,
     InterviewModule,
     MetricsModule,
   ],

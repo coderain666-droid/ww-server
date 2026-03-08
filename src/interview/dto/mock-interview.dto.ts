@@ -1,4 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
 import {
   IsString,
   IsNotEmpty,
@@ -9,6 +10,14 @@ import {
   Min,
   Max,
 } from 'class-validator';
+
+const toOptionalNumber = ({ value }: { value: unknown }) => {
+  if (value === '' || value === null || value === undefined) {
+    return undefined;
+  }
+  const parsed = Number(value);
+  return Number.isNaN(parsed) ? value : parsed;
+};
 
 /**
  * 面试类型枚举
@@ -69,6 +78,8 @@ export class StartMockInterviewDto {
     example: 20,
     required: false,
   })
+  @Transform(toOptionalNumber)
+  @IsNumber({}, { message: '最低薪资必须是数字' })
   @Min(0, { message: '最低薪资不能小于0' })
   @Max(9999, { message: '最低薪资不能超过9999K' })
   @IsOptional()
@@ -79,6 +90,8 @@ export class StartMockInterviewDto {
     example: 35,
     required: false,
   })
+  @Transform(toOptionalNumber)
+  @IsNumber({}, { message: '最高薪资必须是数字' })
   @Min(0, { message: '最高薪资不能小于0' })
   @Max(9999, { message: '最高薪资不能超过9999K' })
   @IsOptional()

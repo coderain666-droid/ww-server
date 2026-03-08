@@ -7,7 +7,8 @@ import {
   RESUME_QUIZ_PROMPT_ANALYSIS_ONLY,
 } from '../prompts/resume-quiz.prompts';
 import {
-  FORMAT_INSTRUCTIONS_QUESTIONS_ONLY,
+  getFormatInstructionsQuestionsOnly,
+  DEFAULT_RESUME_QUIZ_QUESTION_COUNT,
   FORMAT_INSTRUCTIONS_ANALYSIS_ONLY,
 } from '../prompts/format-instructions.prompts';
 import { AIModelFactory } from '../../ai/services/ai-model.factory';
@@ -16,6 +17,11 @@ import {
   buildAssessmentPrompt,
 } from '../prompts/mock-interview.prompts';
 import { LogAICall } from '../../common/decorators/log-ai-call.decorator';
+import {
+  buildLocalAssessment,
+  buildLocalInterviewQuestionContent,
+  streamLocalText,
+} from './local-llm-fallback';
 
 /**
  * 简历押题输入
@@ -103,6 +109,86 @@ export class InterviewAIService {
     private aiModelFactory: AIModelFactory,
   ) {}
 
+  private normalizeSingleLineText(value: unknown): string {
+    return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+  }
+
+  private normalizeQuestionCategory(value: unknown): string {
+    const normalized = this.normalizeSingleLineText(value).toLowerCase();
+
+    if (
+      ['project', '项目', '项目经验', 'project experience'].includes(normalized)
+    ) {
+      return 'project';
+    }
+
+    if (
+      ['problem-solving', 'problem solving', '问题解决', '工程能力'].includes(
+        normalized,
+      )
+    ) {
+      return 'problem-solving';
+    }
+
+    if (
+      ['soft-skill', 'soft skill', '软技能', '协作沟通'].includes(normalized)
+    ) {
+      return 'soft-skill';
+    }
+
+    if (
+      ['behavioral', 'behavior', '行为面试', '成长潜力'].includes(normalized)
+    ) {
+      return 'behavioral';
+    }
+
+    if (['scenario', '场景题', '场景模拟'].includes(normalized)) {
+      return 'scenario';
+    }
+
+    return 'technical';
+  }
+
+  private normalizeQuestionDifficulty(value: unknown): string {
+    const normalized = this.normalizeSingleLineText(value).toLowerCase();
+
+    if (['easy', '简单', '基础'].includes(normalized)) {
+      return 'easy';
+    }
+
+    if (['hard', '困难', '困难题', '高难度'].includes(normalized)) {
+      return 'hard';
+    }
+
+    return 'medium';
+  }
+
+  private normalizeResumeQuizQuestion(question: any) {
+    return {
+      question: this.normalizeSingleLineText(question?.question),
+      answer: this.normalizeSingleLineText(question?.answer),
+      category: this.normalizeQuestionCategory(question?.category),
+      difficulty: this.normalizeQuestionDifficulty(question?.difficulty),
+      tips: this.normalizeSingleLineText(question?.tips),
+      keywords: Array.isArray(question?.keywords)
+        ? question.keywords
+            .map((item) => this.normalizeSingleLineText(item))
+            .filter(Boolean)
+        : [],
+      reasoning: this.normalizeSingleLineText(question?.reasoning),
+    };
+  }
+
+  private ensureResumeQuizUsesRealLLM(): void {
+    if (!this.aiModelFactory.isMockProvider()) {
+      return;
+    }
+
+    throw new Error(
+      '简历押题已禁用本地写死题库。请在 ww-server 中配置真实的 LLM_PROVIDER 和对应 API Key 后重试。',
+    );
+  }
+
   /**
    * 生成简历押题 - 仅押题部分（问题 + 综合评估）
    * 返回：问题列表 + 综合评估 summary
@@ -112,6 +198,7 @@ export class InterviewAIService {
     input: ResumeQuizInput,
   ): Promise<{ questions: any[]; summary: string }> {
     const startTime = Date.now();
+    this.ensureResumeQuizUsesRealLLM();
 
     try {
       // 1. 构建 Prompt
@@ -128,7 +215,12 @@ export class InterviewAIService {
       const model = this.aiModelFactory.createDefaultModel();
       const chain = prompt.pipe(model).pipe(parser);
 
-      // 4. 准备参数
+      // 4. 准备参数（问题数量可配置，默认 10 题，范围 6-16）
+      const questionCount =
+        Number(
+          this.configService.get<string>('RESUME_QUIZ_QUESTION_COUNT'),
+        ) || DEFAULT_RESUME_QUIZ_QUESTION_COUNT;
+
       const salaryRange =
         input.minSalary && input.maxSalary
           ? `${input.minSalary}K-${input.maxSalary}K`
@@ -144,16 +236,25 @@ export class InterviewAIService {
         salaryRange: salaryRange,
         jd: input.jd,
         resumeContent: input.resumeContent,
-        format_instructions: FORMAT_INSTRUCTIONS_QUESTIONS_ONLY,
+        questionCount: String(questionCount),
+        format_instructions: getFormatInstructionsQuestionsOnly(questionCount),
       };
 
       this.logger.log(
         `🚀 [押题部分] 开始生成: company=${params.company}, position=${params.positionName}`,
       );
 
-      // 5. 调用 AI
+      // 5. 调用 AI（控制台可看到「调用大模型」前后日志，便于排查一直加载）
+      this.logger.log('[LLM] 押题部分 invoke 开始...');
       const rawResult = await chain.invoke(params);
-      this.logger.log(`🔍 [押题部分] 原始结果: ${rawResult}`);
+      this.logger.log(
+        '[LLM] 押题部分 invoke 结束，结果长度: ' +
+          (rawResult?.questions?.length ?? 0) +
+          ' 题',
+      );
+      this.logger.log(
+        `🔍 [押题部分] 原始结果长度: questions=${rawResult?.questions?.length ?? 0}`,
+      );
 
       // 6. 验证结果
       // 虽然我们还没有 Zod 验证（下节课才加），但我们可以做基本检查
@@ -161,13 +262,32 @@ export class InterviewAIService {
         throw new Error('AI返回的结果中 questions 不是数组');
       }
 
+      const normalizedQuestions = rawResult.questions
+        .map((item) => this.normalizeResumeQuizQuestion(item))
+        .filter((item) => item.question && item.answer);
+
+      if (normalizedQuestions.length === 0) {
+        throw new Error('AI返回的题目为空，无法生成有效套题');
+      }
+
       const duration = Date.now() - startTime;
       this.logger.log(
-        `✅ [押题部分] 生成成功: 耗时=${duration}ms, 问题数=${rawResult.questions?.length || 0}`,
+        `✅ [押题部分] 生成成功: 耗时=${duration}ms, 问题数=${normalizedQuestions.length}`,
       );
 
-      return rawResult as { questions: any[]; summary: string };
+      return {
+        questions: normalizedQuestions,
+        summary: this.normalizeSingleLineText(rawResult?.summary),
+      };
     } catch (error) {
+      if (this.aiModelFactory.shouldFallbackToMock(error)) {
+        this.logger.error(
+          `❌ [押题部分] 真实 LLM 调用失败，已禁止回退本地写死题库: ${error.message}`,
+        );
+        throw new Error(
+          `真实 LLM 押题失败，请检查 API Key / 模型配置。原始错误：${error.message}`,
+        );
+      }
       const duration = Date.now() - startTime;
       this.logger.error(
         `❌ [押题部分] 生成失败: 耗时=${duration}ms, 错误=${error.message}`,
@@ -182,6 +302,7 @@ export class InterviewAIService {
    */
   async generateResumeQuizAnalysisOnly(input: ResumeQuizInput): Promise<any> {
     const startTime = Date.now();
+    this.ensureResumeQuizUsesRealLLM();
 
     try {
       // 流程与上面类似
@@ -216,13 +337,23 @@ export class InterviewAIService {
         `🚀 [匹配度分析] 开始生成: company=${params.company}, position=${params.positionName}`,
       );
 
+      this.logger.log('[LLM] 匹配度分析 invoke 开始...');
       const result = await chain.invoke(params);
+      this.logger.log('[LLM] 匹配度分析 invoke 结束');
 
       const duration = Date.now() - startTime;
       this.logger.log(`✅ [匹配度分析] 生成成功: 耗时=${duration}ms`);
 
       return result;
     } catch (error) {
+      if (this.aiModelFactory.shouldFallbackToMock(error)) {
+        this.logger.error(
+          `❌ [匹配度分析] 真实 LLM 调用失败，已禁止回退本地写死分析: ${error.message}`,
+        );
+        throw new Error(
+          `真实 LLM 匹配度分析失败，请检查 API Key / 模型配置。原始错误：${error.message}`,
+        );
+      }
       const duration = Date.now() - startTime;
       this.logger.error(
         `❌ [匹配度分析] 生成失败: 耗时=${duration}ms, 错误=${error.message}`,
@@ -266,6 +397,14 @@ export class InterviewAIService {
     elapsedMinutes: number;
     targetDuration: number;
   }): AsyncGenerator<string> {
+    if (this.aiModelFactory.isMockProvider()) {
+      const fullContent = buildLocalInterviewQuestionContent(context);
+      for await (const chunk of streamLocalText(fullContent)) {
+        yield chunk;
+      }
+      return this.parseInterviewResponse(fullContent, context);
+    }
+
     try {
       // 第 1 步：构建 Prompt（动态的）
       // 调用外部函数 buildMockInterviewPrompt，生成面试问题所需的提示内容
@@ -316,6 +455,14 @@ export class InterviewAIService {
       // 返回最终生成的完整内容
       return this.parseInterviewResponse(fullContent, context);
     } catch (error) {
+      if (this.aiModelFactory.shouldFallbackToMock(error)) {
+        this.logger.warn('真实 LLM 追问失败，回退到本地 Mock 输出');
+        const fullContent = buildLocalInterviewQuestionContent(context);
+        for await (const chunk of streamLocalText(fullContent)) {
+          yield chunk;
+        }
+        return this.parseInterviewResponse(fullContent, context);
+      }
       // 错误处理：如果流式生成过程中出现任何异常，记录错误日志并抛出异常
       this.logger.error(
         `❌ 流式生成面试问题失败: ${error.message}`,
@@ -518,6 +665,10 @@ export class InterviewAIService {
    * 基于用户的回答、职位描述、简历等信息，调用AI模型分析并生成一份完整的评估报告
    */
   async generateInterviewAssessmentReport(context): Promise<any> {
+    if (this.aiModelFactory.isMockProvider()) {
+      return buildLocalAssessment(context);
+    }
+
     try {
       // 1. 构建提示(Prompt)
       // 根据传入的上下文信息（如面试类型、问答列表等）构建一个给AI模型的详细指令。
@@ -580,6 +731,10 @@ export class InterviewAIService {
         professionalScore: result.professionalScore || 80, // 专业知识得分
       };
     } catch (error) {
+      if (this.aiModelFactory.shouldFallbackToMock(error)) {
+        this.logger.warn('真实 LLM 评估报告失败，回退到本地 Mock 输出');
+        return buildLocalAssessment(context);
+      }
       // 5. 错误处理
       // 如果在生成过程中发生任何错误，记录详细的错误日志并抛出异常
       this.logger.error(`❌ 生成评估报告失败: ${error.message}`, error.stack);

@@ -44,14 +44,22 @@ import {
   UserTransactionDocument,
   UserTransactionType,
 } from '../../user/schemas/user-transaction.schema';
+import {
+  ResumeRecord,
+  ResumeRecordDocument,
+} from '../../resume/schemas/resume-record.schema';
 
 import { traceIdStorage } from '../../common/middleware/trace-id.middleware';
+import {
+  isMockUserId,
+  getMockObjectId,
+} from '../../auth/mock-user.config';
 
 /**
  * 进度事件
  */
 export interface ProgressEvent {
-  type: 'progress' | 'complete' | 'error' | 'timeout';
+  type: 'progress' | 'complete' | 'yati-complete' | 'error' | 'timeout';
   step?: number;
   label?: string;
   progress: number; // 0-100
@@ -146,6 +154,8 @@ export class InterviewService {
     private aiInterviewResultModel: Model<AIInterviewResultDocument>,
     @InjectModel(UserTransaction.name)
     private userTransactionModel: Model<UserTransactionDocument>,
+    @InjectModel(ResumeRecord.name)
+    private resumeRecordModel: Model<ResumeRecordDocument>,
   ) {}
 
   /**
@@ -276,118 +286,96 @@ export class InterviewService {
     let consumptionRecord: any = null;
     const recordId = uuidv4();
     const resultId = uuidv4();
-    console.log('recordId', recordId);
+    const isMock = isMockUserId(userId);
+    if (isMock) {
+      this.logger.log(
+        `🔓 Mock 用户押题：跳过扣费与消费记录，直连大模型 userId=${userId}`,
+      );
+    }
 
-    // 处理错误
     try {
-      // ========== 步骤 0: 幂等性检查 ==========
-      // ⚠️ 这是最关键的一步：防止重复生成
-      if (dto.requestId) {
-        // 在数据库中查询是否存在这个 requestId 的记录
-        const existingRecord = await this.consumptionRecordModel.findOne({
-          userId,
-          'metadata.requestId': dto.requestId,
-          status: {
-            $in: [ConsumptionStatus.SUCCESS, ConsumptionStatus.PENDING],
-          },
-        });
+      // ========== 商用逻辑：仅非 Mock 用户执行（扣费、幂等、消费记录）==========
+      if (!isMock) {
+        // 步骤 0: 幂等性检查
+        if (dto.requestId) {
+          const existingRecord = await this.consumptionRecordModel.findOne({
+            userId,
+            'metadata.requestId': dto.requestId,
+            status: {
+              $in: [ConsumptionStatus.SUCCESS, ConsumptionStatus.PENDING],
+            },
+          });
 
-        if (existingRecord) {
-          // 找到了相同 requestId 的记录！
-
-          if (existingRecord.status === ConsumptionStatus.SUCCESS) {
-            // 之前已经成功生成过，直接返回已有的结果
-            this.logger.log(
-              `重复请求，返回已有结果: requestId=${dto.requestId}`,
-            );
-
-            // 查询之前生成的结果
-            const existingResult = await this.resumeQuizResultModel.findOne({
-              resultId: existingRecord.resultId,
-            });
-
-            if (!existingResult) {
-              throw new BadRequestException('结果不存在');
+          if (existingRecord) {
+            if (existingRecord.status === ConsumptionStatus.SUCCESS) {
+              this.logger.log(
+                `重复请求，返回已有结果: requestId=${dto.requestId}`,
+              );
+              const existingResult = await this.resumeQuizResultModel.findOne({
+                resultId: existingRecord.resultId,
+              });
+              if (!existingResult) {
+                throw new BadRequestException('结果不存在');
+              }
+              return {
+                resultId: existingResult.resultId,
+                questions: existingResult.questions,
+                summary: existingResult.summary,
+                remainingCount: await this.getRemainingCount(userId, 'resume'),
+                consumptionRecordId: existingRecord.recordId,
+                isFromCache: true,
+              };
             }
-
-            // ✅ 直接返回，不再执行后续步骤，不再扣费
-            return {
-              resultId: existingResult.resultId,
-              questions: existingResult.questions,
-              summary: existingResult.summary,
-              remainingCount: await this.getRemainingCount(userId, 'resume'),
-              consumptionRecordId: existingRecord.recordId,
-              // ⭐ 重要：标记这是从缓存返回的结果
-              isFromCache: true,
-            };
-          }
-
-          if (existingRecord.status === ConsumptionStatus.PENDING) {
-            // 同一个请求还在处理中，告诉用户稍后查询
-            throw new BadRequestException('请求正在处理中，请稍后查询结果');
+            if (existingRecord.status === ConsumptionStatus.PENDING) {
+              throw new BadRequestException('请求正在处理中，请稍后查询结果');
+            }
           }
         }
+
+        // 步骤 1: 检查并扣除次数
+        const user = await this.userModel.findOneAndUpdate(
+          {
+            _id: userId,
+            resumeRemainingCount: { $gt: 0 },
+          },
+          { $inc: { resumeRemainingCount: -1 } },
+          { new: false },
+        );
+        if (!user) {
+          throw new BadRequestException('简历押题次数不足，请前往充值页面购买');
+        }
+        this.logger.log(
+          `✅ 用户扣费成功: userId=${userId}, 扣费前=${user.resumeRemainingCount}, 扣费后=${user.resumeRemainingCount - 1}`,
+        );
+
+        // 步骤 2: 创建消费记录（pending）
+        consumptionRecord = await this.consumptionRecordModel.create({
+          recordId,
+          user: new Types.ObjectId(userId),
+          userId,
+          type: ConsumptionType.RESUME_QUIZ,
+          status: ConsumptionStatus.PENDING,
+          consumedCount: 1,
+          description: `简历押题 - ${dto?.company} ${dto.positionName}`,
+          inputData: {
+            company: dto?.company || '',
+            positionName: dto.positionName,
+            minSalary: dto.minSalary,
+            maxSalary: dto.maxSalary,
+            jd: dto.jd,
+            resumeId: dto.resumeId,
+          },
+          resultId,
+          metadata: {
+            requestId: dto.requestId,
+            promptVersion: dto.promptVersion,
+          },
+          startedAt: new Date(),
+        });
+        this.logger.log(`✅ 消费记录创建成功: recordId=${recordId}`);
       }
 
-      // ========== 步骤 1: 检查并扣除次数（原子操作）==========
-      // ⚠️ 注意：扣费后如果后续步骤失败，会在 catch 块中自动退款
-
-      const user = await this.userModel.findOneAndUpdate(
-        {
-          _id: userId,
-          resumeRemainingCount: { $gt: 0 }, // 条件：必须余额 > 0
-        },
-        {
-          $inc: { resumeRemainingCount: -1 }, // 原子操作：余额 - 1
-        },
-        { new: false }, // 返回更新前的文档，用于日志记录
-      );
-
-      // 检查扣费是否成功
-      if (!user) {
-        throw new BadRequestException('简历押题次数不足，请前往充值页面购买');
-      }
-
-      // 记录详细日志
-      this.logger.log(
-        `✅ 用户扣费成功: userId=${userId}, 扣费前=${user.resumeRemainingCount}, 扣费后=${user.resumeRemainingCount - 1}`,
-      );
-
-      // ========== 步骤 2: 创建消费记录（pending）==========
-
-      consumptionRecord = await this.consumptionRecordModel.create({
-        recordId, // 消费记录唯一ID
-        user: new Types.ObjectId(userId),
-        userId,
-        type: ConsumptionType.RESUME_QUIZ, // 消费类型
-        status: ConsumptionStatus.PENDING, // ⭐ 关键：标记为处理中
-        consumedCount: 1, // 消费次数
-        description: `简历押题 - ${dto?.company} ${dto.positionName}`,
-
-        // 记录输入参数（用于调试和重现问题）
-        inputData: {
-          company: dto?.company || '',
-          positionName: dto.positionName,
-          minSalary: dto.minSalary,
-          maxSalary: dto.maxSalary,
-          jd: dto.jd,
-          resumeId: dto.resumeId,
-        },
-
-        resultId, // 结果ID（稍后会生成）
-
-        // 元数据（包含幂等性检查的 requestId）
-        metadata: {
-          requestId: dto.requestId, // ← 用于幂等性检查
-          promptVersion: dto.promptVersion,
-        },
-
-        startedAt: new Date(), // 记录开始时间
-      });
-
-      this.logger.log(`✅ 消费记录创建成功: recordId=${recordId}`);
-
-      // ========== 阶段 1: 准备阶段==========
+      // ========== 阶段 1: 准备阶段（所有用户）==========
       this.emitProgress(
         progressSubject,
         0,
@@ -469,9 +457,10 @@ export class InterviewService {
       };
 
       // ========== 阶段 3: 保存结果阶段==========
-      const quizResult = await this.resumeQuizResultModel.create({
+      const userObjectId = isMock ? getMockObjectId() : new Types.ObjectId(userId);
+      await this.resumeQuizResultModel.create({
         resultId,
-        user: new Types.ObjectId(userId),
+        user: userObjectId,
         userId,
         resumeId: dto.resumeId,
         company: dto?.company || '',
@@ -480,7 +469,6 @@ export class InterviewService {
         questions: aiResult.questions,
         totalQuestions: aiResult.questions.length,
         summary: aiResult.summary,
-        // AI生成的分析报告数据
         matchScore: aiResult.matchScore,
         matchLevel: aiResult.matchLevel,
         matchedSkills: aiResult.matchedSkills,
@@ -491,36 +479,36 @@ export class InterviewService {
         strengths: aiResult.strengths,
         weaknesses: aiResult.weaknesses,
         interviewTips: aiResult.interviewTips,
-        // 元数据
-        consumptionRecordId: recordId,
+        consumptionRecordId: isMock ? undefined : recordId,
         aiModel: 'deepseek-chat',
         promptVersion: dto.promptVersion || 'v2',
       });
 
       this.logger.log(`✅ 结果保存成功: resultId=${resultId}`);
 
-      // 更新消费记录为成功
-      await this.consumptionRecordModel.findByIdAndUpdate(
-        consumptionRecord._id,
-        {
-          $set: {
-            status: ConsumptionStatus.SUCCESS,
-            outputData: {
-              resultId,
-              questionCount: aiResult.questions.length,
+      // 更新消费记录为成功（仅商用：有消费记录时）
+      if (consumptionRecord) {
+        await this.consumptionRecordModel.findByIdAndUpdate(
+          consumptionRecord._id,
+          {
+            $set: {
+              status: ConsumptionStatus.SUCCESS,
+              outputData: {
+                resultId,
+                questionCount: aiResult.questions.length,
+              },
+              aiModel: 'deepseek-chat',
+              promptTokens: aiResult.usage?.promptTokens,
+              completionTokens: aiResult.usage?.completionTokens,
+              totalTokens: aiResult.usage?.totalTokens,
+              completedAt: new Date(),
             },
-            aiModel: 'deepseek-chat',
-            promptTokens: aiResult.usage?.promptTokens,
-            completionTokens: aiResult.usage?.completionTokens,
-            totalTokens: aiResult.usage?.totalTokens,
-            completedAt: new Date(),
           },
-        },
-      );
-
-      this.logger.log(
-        `✅ 消费记录已更新为成功状态: recordId=${consumptionRecord.recordId}`,
-      );
+        );
+        this.logger.log(
+          `✅ 消费记录已更新为成功状态: recordId=${consumptionRecord.recordId}`,
+        );
+      }
       // ========== 阶段 4: 返回结果==========
       const result = {
         resultId: resultId,
@@ -539,12 +527,26 @@ export class InterviewService {
         interviewTips: analysisResult.interviewTips,
       };
 
-      // 发送完成事件
+      // 发送 100% 进度
       this.emitProgress(
         progressSubject,
         100,
-        `✅ 所有分析完成，正在保存结果...响应数据为${JSON.stringify(result)}`,
+        '✅ 所有分析完成，正在保存结果...',
       );
+      // 前端依赖此事件渲染押题结果，必须发送
+      if (progressSubject && !progressSubject.closed) {
+        progressSubject.next({
+          type: 'yati-complete',
+          progress: 100,
+          data: {
+            resultId: result.resultId,
+            questions: result.questions,
+            summary: result.summary,
+          },
+        });
+        progressSubject.next({ type: 'complete', progress: 100 });
+        progressSubject.complete();
+      }
       return result;
     } catch (error) {
       this.logger.error(
@@ -552,27 +554,25 @@ export class InterviewService {
         error.stack,
       );
 
-      // ========== 失败回滚流程 ==========
-      try {
-        // 1. 返还次数（最重要！）
-        this.logger.log(`🔄 开始退还次数: userId=${userId}`);
-        await this.refundCount(userId, 'resume');
-        this.logger.log(`✅ 次数退还成功: userId=${userId}`);
+      // ========== 失败回滚流程（仅商用：有扣费/消费记录时）==========
+      if (consumptionRecord) {
+        try {
+          this.logger.log(`🔄 开始退还次数: userId=${userId}`);
+          await this.refundCount(userId, 'resume');
+          this.logger.log(`✅ 次数退还成功: userId=${userId}`);
 
-        // 2. 更新消费记录为失败
-        if (consumptionRecord) {
           await this.consumptionRecordModel.findByIdAndUpdate(
             consumptionRecord._id,
             {
               $set: {
-                status: ConsumptionStatus.FAILED, // 标记为失败
-                errorMessage: error.message, // 记录错误信息
+                status: ConsumptionStatus.FAILED,
+                errorMessage: error.message,
                 errorStack:
                   process.env.NODE_ENV === 'development'
-                    ? error.stack // 开发环境记录堆栈
-                    : undefined, // 生产环境不记录（隐私考虑）
+                    ? error.stack
+                    : undefined,
                 failedAt: new Date(),
-                isRefunded: true, // ← 标记为已退款
+                isRefunded: true,
                 refundedAt: new Date(),
               },
             },
@@ -580,23 +580,12 @@ export class InterviewService {
           this.logger.log(
             `✅ 消费记录已更新为失败状态: recordId=${consumptionRecord.recordId}`,
           );
+        } catch (refundError) {
+          this.logger.error(
+            `🚨 退款流程失败！需要人工介入！userId=${userId}, originalError=${error.message}, refundError=${refundError.message}`,
+            refundError.stack,
+          );
         }
-      } catch (refundError) {
-        // ⚠️ 退款失败是严重问题，需要人工介入！
-        this.logger.error(
-          `🚨 退款流程失败！这是严重问题，需要人工介入！` +
-            `userId=${userId}, ` +
-            `originalError=${error.message}, ` +
-            `refundError=${refundError.message}`,
-          refundError.stack,
-        );
-
-        // TODO: 这里应该发送告警通知（钉钉、邮件等）
-        // await this.alertService.sendCriticalAlert({
-        //   type: 'REFUND_FAILED',
-        //   userId,
-        //   error: refundError.message,
-        // });
       }
 
       // 3. 发送错误事件给前端
@@ -605,7 +594,7 @@ export class InterviewService {
           type: 'error',
           progress: 0,
           label: '❌ 生成失败',
-          error: error,
+          error: error?.message || '生成失败，请稍后重试',
         });
         progressSubject.complete();
       }
@@ -622,6 +611,11 @@ export class InterviewService {
     userId: string,
     type: 'resume' | 'special' | 'behavior',
   ): Promise<void> {
+    if (isMockUserId(userId)) {
+      this.logger.log(`🔓 Mock 用户跳过退还次数: userId=${userId}, type=${type}`);
+      return;
+    }
+
     const field =
       type === 'resume'
         ? 'resumeRemainingCount'
@@ -682,6 +676,10 @@ export class InterviewService {
     userId: string,
     type: 'resume' | 'special' | 'behavior',
   ): Promise<number> {
+    if (isMockUserId(userId)) {
+      return 99;
+    }
+
     const user = await this.userModel.findById(userId);
     if (!user) return 0;
 
@@ -777,8 +775,28 @@ export class InterviewService {
       return dto.resumeContent;
     }
 
-    // 优先级 2：如果提供了 resumeId，尝试查询
-    // 之前 ResumeQuizDto 中没有创建 resumeURL 的属性，所以这里需要在 ResumeQuizDto 中补充以下 resumeURL
+    // 优先级 2：如果提供了 resumeId，尝试查询本地简历记录并转成 resumeURL
+    if (dto.resumeId) {
+      const resumeRecord = await this.resumeRecordModel
+        .findOne({
+          userId,
+          resumeId: dto.resumeId,
+        })
+        .lean();
+
+      if (resumeRecord?.contentSnapshot) {
+        this.logger.log(
+          `✅ 使用已缓存的简历文本快照: resumeId=${dto.resumeId}, 长度=${resumeRecord.contentSnapshot.length}字符`,
+        );
+        return resumeRecord.contentSnapshot;
+      }
+
+      if (resumeRecord?.url) {
+        dto.resumeURL = resumeRecord.url;
+      }
+    }
+
+    // 优先级 3：如果提供了 resumeURL，尝试解析
     if (dto.resumeURL) {
       try {
         // 1. 从 URL 下载文件
@@ -902,6 +920,8 @@ export class InterviewService {
     progressSubject: Subject<MockInterviewEventDto>,
   ): Promise<void> {
     try {
+      const isMock = isMockUserId(userId);
+
       // 1. 检查并扣除次数
       // 根据面试类型选择扣费字段
       const countField =
@@ -909,28 +929,34 @@ export class InterviewService {
           ? 'specialRemainingCount'
           : 'behaviorRemainingCount';
 
-      // 查找用户并确保剩余次数足够
-      const user = await this.userModel.findOneAndUpdate(
-        {
-          _id: userId,
-          [countField]: { $gt: 0 },
-        },
-        {
-          $inc: { [countField]: -1 }, // 扣除一次模拟面试的次数
-        },
-        { new: false },
-      );
+      if (isMock) {
+        this.logger.log(
+          `🔓 Mock 用户模拟面试：跳过扣费与消费记录，直连大模型 userId=${userId}`,
+        );
+      } else {
+        // 查找用户并确保剩余次数足够
+        const user = await this.userModel.findOneAndUpdate(
+          {
+            _id: userId,
+            [countField]: { $gt: 0 },
+          },
+          {
+            $inc: { [countField]: -1 }, // 扣除一次模拟面试的次数
+          },
+          { new: false },
+        );
 
-      // 如果用户没有足够的次数，抛出异常
-      if (!user) {
-        throw new BadRequestException(
-          `${dto.interviewType === MockInterviewType.SPECIAL ? '专项面试' : '综合面试'}次数不足，请前往充值页面购买`,
+        // 如果用户没有足够的次数，抛出异常
+        if (!user) {
+          throw new BadRequestException(
+            `${dto.interviewType === MockInterviewType.SPECIAL ? '专项面试' : '综合面试'}次数不足，请前往充值页面购买`,
+          );
+        }
+
+        this.logger.log(
+          `✅ 用户扣费成功: userId=${userId}, type=${dto.interviewType}, 扣费前=${user[countField]}, 扣费后=${user[countField] - 1}`,
         );
       }
-
-      this.logger.log(
-        `✅ 用户扣费成功: userId=${userId}, type=${dto.interviewType}, 扣费前=${user[countField]}, 扣费后=${user[countField] - 1}`,
-      );
 
       // 2. 提取简历内容
       // 提取用户简历内容
@@ -983,7 +1009,8 @@ export class InterviewService {
 
       // 4. 创建数据库记录并生成 resultId
       const resultId = uuidv4();
-      const recordId = uuidv4();
+      const recordId = isMock ? undefined : uuidv4();
+      const userObjectId = isMock ? getMockObjectId() : new Types.ObjectId(userId);
 
       // 为会话分配 resultId 和消费记录ID
       session.resultId = resultId;
@@ -992,7 +1019,7 @@ export class InterviewService {
       // 保存面试结果记录到数据库
       await this.aiInterviewResultModel.create({
         resultId,
-        user: new Types.ObjectId(userId),
+        user: userObjectId,
         userId,
         interviewType:
           dto.interviewType === MockInterviewType.SPECIAL
@@ -1017,29 +1044,31 @@ export class InterviewService {
       });
 
       // 创建消费记录
-      await this.consumptionRecordModel.create({
-        resultId,
-        recordId,
-        user: new Types.ObjectId(userId),
-        userId,
-        type:
-          dto.interviewType === MockInterviewType.SPECIAL
-            ? ConsumptionType.SPECIAL_INTERVIEW
-            : ConsumptionType.BEHAVIOR_INTERVIEW,
-        status: ConsumptionStatus.SUCCESS,
-        consumedCount: 1,
-        description: `模拟面试 - ${dto.interviewType === MockInterviewType.SPECIAL ? '专项面试' : '综合面试'}`,
-        inputData: {
-          company: dto.company || '',
-          position: dto.positionName,
-          interviewType: dto.interviewType,
-        },
-        outputData: {
+      if (!isMock && recordId) {
+        await this.consumptionRecordModel.create({
           resultId,
-          sessionId,
-        },
-        startedAt: session.startTime,
-      });
+          recordId,
+          user: userObjectId,
+          userId,
+          type:
+            dto.interviewType === MockInterviewType.SPECIAL
+              ? ConsumptionType.SPECIAL_INTERVIEW
+              : ConsumptionType.BEHAVIOR_INTERVIEW,
+          status: ConsumptionStatus.SUCCESS,
+          consumedCount: 1,
+          description: `模拟面试 - ${dto.interviewType === MockInterviewType.SPECIAL ? '专项面试' : '综合面试'}`,
+          inputData: {
+            company: dto.company || '',
+            position: dto.positionName,
+            interviewType: dto.interviewType,
+          },
+          outputData: {
+            resultId,
+            sessionId,
+          },
+          startedAt: session.startTime,
+        });
+      }
 
       this.logger.log(
         `✅ 面试会话创建成功: sessionId=${sessionId}, resultId=${resultId}, interviewer=${interviewerName}`,
@@ -1589,6 +1618,11 @@ export class InterviewService {
     session: InterviewSession,
   ): Promise<string> {
     try {
+      const isMock = isMockUserId(session.userId);
+      const userObjectId = isMock
+        ? getMockObjectId()
+        : new Types.ObjectId(session.userId);
+
       // 如果已经有 resultId（通过实时保存创建），直接返回
       if (session.resultId) {
         this.logger.log(
@@ -1625,7 +1659,7 @@ export class InterviewService {
 
       // 如果没有 resultId（没有启用实时保存或出错），使用原有逻辑创建完整记录
       const resultId = uuidv4(); // 生成新的 resultId
-      const recordId = uuidv4(); // 生成新的消费记录ID
+      const recordId = isMock ? undefined : uuidv4(); // 生成新的消费记录ID
 
       // 构建问答列表（包含标准答案）
       const qaList: any[] = [];
@@ -1649,7 +1683,7 @@ export class InterviewService {
       // 创建面试结果记录
       await this.aiInterviewResultModel.create({
         resultId,
-        user: new Types.ObjectId(session.userId),
+        user: userObjectId,
         userId: session.userId,
         interviewType:
           session.interviewType === MockInterviewType.SPECIAL
@@ -1674,31 +1708,33 @@ export class InterviewService {
       });
 
       // 创建消费记录
-      await this.consumptionRecordModel.create({
-        recordId,
-        user: new Types.ObjectId(session.userId),
-        userId: session.userId,
-        type:
-          session.interviewType === MockInterviewType.SPECIAL
-            ? ConsumptionType.SPECIAL_INTERVIEW
-            : ConsumptionType.BEHAVIOR_INTERVIEW,
-        status: ConsumptionStatus.SUCCESS, // 消费状态成功
-        consumedCount: 1, // 消费次数
-        description: `模拟面试 - ${session.interviewType === MockInterviewType.SPECIAL ? '专项面试' : '综合面试'}`, // 描述
-        inputData: {
-          company: session.company || '',
-          positionName: session.positionName,
-          interviewType: session.interviewType,
-        },
-        outputData: {
+      if (!isMock && recordId) {
+        await this.consumptionRecordModel.create({
+          recordId,
+          user: userObjectId,
+          userId: session.userId,
+          type:
+            session.interviewType === MockInterviewType.SPECIAL
+              ? ConsumptionType.SPECIAL_INTERVIEW
+              : ConsumptionType.BEHAVIOR_INTERVIEW,
+          status: ConsumptionStatus.SUCCESS, // 消费状态成功
+          consumedCount: 1, // 消费次数
+          description: `模拟面试 - ${session.interviewType === MockInterviewType.SPECIAL ? '专项面试' : '综合面试'}`, // 描述
+          inputData: {
+            company: session.company || '',
+            positionName: session.positionName,
+            interviewType: session.interviewType,
+          },
+          outputData: {
+            resultId,
+            questionCount: qaList.length, // 问题数量
+            duration: durationMinutes, // 面试时长
+          },
           resultId,
-          questionCount: qaList.length, // 问题数量
-          duration: durationMinutes, // 面试时长
-        },
-        resultId,
-        startedAt: session.startTime, // 开始时间
-        completedAt: new Date(), // 完成时间
-      });
+          startedAt: session.startTime, // 开始时间
+          completedAt: new Date(), // 完成时间
+        });
+      }
 
       this.logger.log(
         `✅ 面试结果保存成功（完整创建）: resultId=${resultId}, duration=${durationMinutes}min`,
@@ -2201,6 +2237,199 @@ export class InterviewService {
     }
 
     throw new NotFoundException('未找到该分析报告');
+  }
+
+  async getResumeQuizHistory(
+    userId: string,
+    options?: { page: number; limit: number },
+  ) {
+    const page = Math.max(1, Number(options?.page) || 1);
+    const limit = Math.max(1, Math.min(50, Number(options?.limit) || 10));
+    const skip = (page - 1) * limit;
+
+    const [records, total] = await Promise.all([
+      this.resumeQuizResultModel
+        .find({ userId, isArchived: { $ne: true } })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      this.resumeQuizResultModel.countDocuments({
+        userId,
+        isArchived: { $ne: true },
+      }),
+    ]);
+
+    return {
+      records: records.map((record: any) => ({
+        id: record._id?.toString?.() || record.resultId,
+        resultId: record.resultId,
+        createdAt: record.createdAt,
+        status: 'success',
+        inputData: {
+          company: record.company || '',
+          positionName: record.position || '',
+          position: record.position || '',
+          jd: record.jobDescription || '',
+          salaryRange: record.salaryRange || '',
+        },
+      })),
+      total,
+      page,
+      limit,
+    };
+  }
+
+  async getResumeQuizResultDetail(userId: string, resultId: string) {
+    const result = await this.resumeQuizResultModel.findOne({
+      userId,
+      resultId,
+    }).lean();
+    if (!result) {
+      throw new NotFoundException('未找到该简历押题记录');
+    }
+
+    return {
+      resultId: result.resultId,
+      company: result.company || '',
+      position: result.position || '',
+      salaryRange: result.salaryRange || '',
+      jobDescription: result.jobDescription || '',
+      summary: result.summary || '',
+      questions: result.questions || [],
+      createdAt: (result as any).createdAt,
+    };
+  }
+
+  async getInterviewHistory(
+    userId: string,
+    interviewType: 'special' | 'behavior',
+    options?: { page: number; limit: number },
+  ) {
+    const page = Math.max(1, Number(options?.page) || 1);
+    const limit = Math.max(1, Math.min(50, Number(options?.limit) || 10));
+    const skip = (page - 1) * limit;
+
+    const [records, total] = await Promise.all([
+      this.aiInterviewResultModel
+        .find({
+          userId,
+          interviewType,
+          isArchived: { $ne: true },
+        })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      this.aiInterviewResultModel.countDocuments({
+        userId,
+        interviewType,
+        isArchived: { $ne: true },
+      }),
+    ]);
+
+    return {
+      records: records.map((record: any) => ({
+        id: record._id?.toString?.() || record.resultId,
+        resultId: record.resultId,
+        createdAt: record.createdAt,
+        status: record.status === 'completed' ? 'success' : record.status,
+        inputData: {
+          company: record.company || '',
+          positionName: record.position || '',
+          position: record.position || '',
+          jd: record.jobDescription || '',
+          salaryRange: record.salaryRange || '',
+        },
+      })),
+      total,
+      page,
+      limit,
+    };
+  }
+
+  async getMockInterviewQAResult(userId: string, resultId: string) {
+    const result = await this.aiInterviewResultModel.findOne({
+      userId,
+      resultId,
+    }).lean();
+    if (!result) {
+      throw new NotFoundException('未找到该模拟面试记录');
+    }
+
+    return {
+      resultId: result.resultId,
+      questions: result.qaList || [],
+      createdAt: (result as any).createdAt,
+    };
+  }
+
+  async getMockInterviewSessionHistory(userId: string, resultId: string) {
+    const result = await this.aiInterviewResultModel.findOne({
+      userId,
+      resultId,
+    }).lean();
+    if (!result) {
+      throw new NotFoundException('未找到该模拟面试记录');
+    }
+
+    const sessionState = result.sessionState || {};
+    const createdAt = (result as any).createdAt;
+    const updatedAt = (result as any).updatedAt;
+    const derivedConversationHistory = Array.isArray(sessionState.conversationHistory)
+      ? sessionState.conversationHistory
+      : (result.qaList || []).flatMap((qa: any) => {
+          const historyItems: Array<Record<string, any>> = [];
+          if (qa.question) {
+            historyItems.push({
+              role: 'interviewer',
+              content: qa.question,
+              timestamp: qa.askedAt || createdAt,
+              referenceAnswer: qa.standardAnswer || '',
+            });
+          }
+          if (qa.answer) {
+            historyItems.push({
+              role: 'candidate',
+              content: qa.answer,
+              timestamp: qa.answeredAt || qa.savedAt || updatedAt,
+            });
+          }
+          return historyItems;
+        });
+
+    return {
+      conversationHistory: derivedConversationHistory.map((item: any) => ({
+        ...item,
+        referenceAnswer:
+          item.referenceAnswer || item.standardAnswer || '',
+      })),
+      sessionInfo: {
+        sessionId: sessionState.sessionId || result.resultId,
+        interviewerName: sessionState.interviewerName || 'AI 面试官',
+        position: sessionState.positionName || result.position || '',
+        status: result.status,
+      },
+    };
+  }
+
+  async getUnfinishedInterviewList(userId: string) {
+    const records = await this.aiInterviewResultModel
+      .find({
+        userId,
+        status: { $in: ['in_progress', 'paused'] },
+      })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    return records.map((record: any) => ({
+      resultId: record.resultId,
+      company: record.company || '',
+      position: record.position || '',
+      status: record.status,
+      updatedAt: record.updatedAt,
+      createdAt: record.createdAt,
+    }));
   }
 
   /**

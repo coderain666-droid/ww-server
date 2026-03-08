@@ -1,4 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AlipaySdk } from 'alipay-sdk';
 import { PaymentChannel, PaymentOrderPayload } from '../payment.types';
@@ -32,7 +36,8 @@ export class AlipayPaymentService {
   private readonly notifyUrl: string;
 
   /** 支付宝 SDK 实例，封装了接口调用与签名逻辑 */
-  private readonly alipaySdk: AlipaySdk;
+  private readonly alipaySdk?: AlipaySdk;
+  private readonly enabled: boolean;
 
   /**
    * 构造函数：从配置中心读取支付宝相关配置，并初始化 AlipaySdk
@@ -57,6 +62,17 @@ export class AlipayPaymentService {
     // 支付宝异步通知回调地址
     this.notifyUrl = this.configService.get<string>('ALIPAY_NOTIFY_URL') || '';
 
+    this.enabled = Boolean(
+      this.appId && this.privateKey && this.alipayPublicKey,
+    );
+
+    if (!this.enabled) {
+      this.logger.warn(
+        '支付宝支付配置缺失，已禁用本地支付能力；不影响 AI 面试主流程',
+      );
+      return;
+    }
+
     // 初始化支付宝 SDK
     this.alipaySdk = new AlipaySdk({
       appId: this.appId,
@@ -74,6 +90,8 @@ export class AlipayPaymentService {
    * @returns 统一封装后的支付订单结果
    */
   async initiatePayment(payload: PaymentOrderPayload): Promise<any> {
+    const alipaySdk = this.getAlipaySdk();
+
     // 构造支付宝接口所需的 bizContent 参数
     const bizContent: Record<string, any> = {
       // 商户订单号（业务系统生成，需全局唯一）
@@ -104,7 +122,7 @@ export class AlipayPaymentService {
        * 官方文档：
        * https://opendocs.alipay.com/open/8ad49e4a_alipay.trade.precreate
        */
-      const response = await this.alipaySdk.exec('alipay.trade.precreate', {
+      const response = await alipaySdk.exec('alipay.trade.precreate', {
         bizContent,
         // 优先使用本次订单指定的 notifyUrl，否则使用全局配置
         notifyUrl: payload.notifyUrl || this.notifyUrl,
@@ -144,13 +162,25 @@ export class AlipayPaymentService {
    * @returns 支付宝返回的订单状态信息
    */
   async queryTrade(orderId: string): Promise<Record<string, any>> {
+    const alipaySdk = this.getAlipaySdk();
+
     try {
-      return await this.alipaySdk.exec('alipay.trade.query', {
+      return await alipaySdk.exec('alipay.trade.query', {
         bizContent: { out_trade_no: orderId },
       });
     } catch (error) {
       this.logger.error('调用支付宝订单查询失败', error as Error);
       throw error;
     }
+  }
+
+  private getAlipaySdk(): AlipaySdk {
+    if (!this.alipaySdk) {
+      throw new ServiceUnavailableException(
+        '支付宝支付未配置，本地模式下请忽略支付能力',
+      );
+    }
+
+    return this.alipaySdk;
   }
 }

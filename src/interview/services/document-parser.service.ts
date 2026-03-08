@@ -1,5 +1,7 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
+import * as https from 'https';
 import * as pdf from 'pdf-parse';
 import * as mammoth from 'mammoth';
 
@@ -11,6 +13,16 @@ import * as mammoth from 'mammoth';
 export class DocumentParserService {
   private readonly logger = new Logger(DocumentParserService.name);
 
+  constructor(private readonly configService: ConfigService) {}
+
+  /** 是否跳过 HTTPS 证书校验（解决 unable to get local issuer certificate，仅建议开发/内网使用） */
+  private shouldSkipSslVerify(): boolean {
+    const explicit = this.configService.get<string>('SKIP_SSL_VERIFY_FOR_DOWNLOAD');
+    if (explicit === 'true' || explicit === '1') return true;
+    if (explicit === 'false' || explicit === '0') return false;
+    return this.configService.get<string>('NODE_ENV') !== 'production';
+  }
+
   // 支持的文件类型
   private readonly SUPPORTED_TYPES = {
     PDF: ['.pdf'],
@@ -19,6 +31,42 @@ export class DocumentParserService {
 
   // 最大文件大小 (10MB)
   private readonly MAX_FILE_SIZE = 10 * 1024 * 1024;
+
+  private createDownloadOptions(
+    skipSslVerify: boolean,
+  ): axios.AxiosRequestConfig {
+    const opts: axios.AxiosRequestConfig = {
+      responseType: 'arraybuffer',
+      timeout: 30000,
+      maxContentLength: this.MAX_FILE_SIZE,
+      maxBodyLength: this.MAX_FILE_SIZE,
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; ResumeParser/1.0)',
+      },
+    };
+
+    if (skipSslVerify) {
+      // 无论原始 URL 是 http 还是 https，都预先注入 httpsAgent。
+      // 这样即使发生 http -> https 重定向，也不会在跳转后的 TLS 握手阶段报
+      // "unable to get local issuer certificate"。
+      opts.httpsAgent = new https.Agent({ rejectUnauthorized: false });
+    }
+
+    return opts;
+  }
+
+  private isTlsCertificateError(error: any): boolean {
+    const message = `${error?.message || ''}`.toLowerCase();
+    const code = `${error?.code || ''}`.toUpperCase();
+    return (
+      code.startsWith('CERT_') ||
+      code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+      /unable to get local issuer certificate|self signed certificate|certificate/i.test(
+        message,
+      )
+    );
+  }
 
   /**
    * 从 URL 下载并解析文档
@@ -58,6 +106,33 @@ export class DocumentParserService {
     } catch (error) {
       this.logger.error(`文档解析失败: ${error.message}`, error.stack);
       throw error;
+    }
+  }
+
+  /**
+   * 直接解析上传的文件 Buffer
+   * 适用于本地直传，避免依赖外部 URL 可用性
+   */
+  async parseDocumentFromBuffer(
+    buffer: Buffer,
+    fileName: string,
+  ): Promise<string> {
+    if (!buffer || buffer.length === 0) {
+      throw new BadRequestException('上传文件为空');
+    }
+
+    const fileType = this.getFileType(fileName || '');
+    if (!fileType) {
+      throw new BadRequestException('不支持的文件格式。当前仅支持: PDF, DOCX');
+    }
+
+    switch (fileType) {
+      case 'PDF':
+        return this.parsePdf(buffer);
+      case 'DOCX':
+        return this.parseDocx(buffer);
+      default:
+        throw new BadRequestException('不支持的文件格式。当前仅支持: PDF, DOCX');
     }
   }
 
@@ -107,16 +182,22 @@ export class DocumentParserService {
   private async downloadFile(url: string): Promise<Buffer> {
     try {
       this.logger.log(`开始下载文件: ${url}`);
+      const skipSslVerify = this.shouldSkipSslVerify();
+      const opts = this.createDownloadOptions(skipSslVerify);
+      let response;
 
-      const response = await axios.get(url, {
-        responseType: 'arraybuffer',
-        timeout: 30000, // 30秒超时
-        maxContentLength: this.MAX_FILE_SIZE,
-        maxBodyLength: this.MAX_FILE_SIZE,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; ResumeParser/1.0)',
-        },
-      });
+      try {
+        response = await axios.get(url, opts);
+      } catch (error) {
+        if (skipSslVerify && this.isTlsCertificateError(error)) {
+          this.logger.warn(
+            `下载简历文件命中 TLS 证书错误，已按本地模式放宽校验后重试: ${error.message}`,
+          );
+          response = await axios.get(url, this.createDownloadOptions(true));
+        } else {
+          throw error;
+        }
+      }
 
       const buffer = Buffer.from(response.data);
 

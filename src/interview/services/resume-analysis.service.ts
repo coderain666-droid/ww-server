@@ -3,6 +3,7 @@ import { PromptTemplate } from '@langchain/core/prompts';
 import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { AIModelFactory } from '../../ai/services/ai-model.factory';
 import { RESUME_ANALYSIS_PROMPT } from '../prompts/resume-analysis.prompts';
+import { buildLocalResumeAnalysis } from './local-llm-fallback';
 
 /**
  * 简历分析服务
@@ -32,6 +33,10 @@ export class ResumeAnalysisService {
    * @returns 分析结果（JSON 对象）
    */
   async analyze(resumeContent: string, jobDescription: string): Promise<any> {
+    if (this.aiModelFactory.isMockProvider()) {
+      return buildLocalResumeAnalysis(resumeContent, jobDescription);
+    }
+
     // 第一步：创建 Prompt 模板
     const prompt = PromptTemplate.fromTemplate(RESUME_ANALYSIS_PROMPT);
 
@@ -56,6 +61,10 @@ export class ResumeAnalysisService {
       this.logger.log('简历分析完成');
       return result;
     } catch (error) {
+      if (this.aiModelFactory.shouldFallbackToMock(error)) {
+        this.logger.warn('真实 LLM 分析简历失败，回退到本地 Mock 输出');
+        return buildLocalResumeAnalysis(resumeContent, jobDescription);
+      }
       this.logger.error('简历分析失败:', error);
       throw error;
     }

@@ -1,32 +1,22 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { BaseChatModel } from '@langchain/core/language_models/chat_models';
+import { ChatOpenAI } from '@langchain/openai';
 import { ChatDeepSeek } from '@langchain/deepseek';
+import { requestContextStorage } from '../../common/request-context/request-context';
+
+export type LLMProvider = 'openai' | 'deepseek' | 'mock';
 
 /**
  * AI 模型工厂服务
  *
- * 这个服务负责初始化和管理 AI 模型。
- * 所有的模型初始化逻辑都集中在这里。
+ * 集中管理 AI 模型初始化，支持 OpenAI (GPT) 与 DeepSeek。
+ * 默认使用 DeepSeek，可通过环境变量 LLM_PROVIDER 切换。
  *
- * 好处：
- * - 集中管理：所有模型配置都在一个地方
- * - 易于切换：以后要换模型（比如从 DeepSeek 换成 OpenAI），只需要改这个文件
- * - 易于复用：任何服务都可以使用这个工厂来获取模型
- * - 易于测试：可以单独测试模型初始化逻辑
- *
- * 如何在其他服务中使用？
- *
- * @Injectable()
- * export class QuizService {
- *   constructor(
- *     private aiModelFactory: AIModelFactory
- *   ) {}
- *
- *   async generateQuiz() {
- *     const model = this.aiModelFactory.createDefaultModel();
- *     // 使用 model
- *   }
- * }
+ * 环境变量：
+ * - LLM_PROVIDER：'openai' | 'deepseek'，默认 'deepseek'
+ * - OpenAI：OPENAI_API_KEY（必填当 provider=openai）、OPENAI_MODEL、OPENAI_TEMPERATURE、OPENAI_MAX_TOKENS
+ * - DeepSeek：DEEPSEEK_API_KEY（必填当 provider=deepseek）、DEEPSEEK_MODEL、DEEPSEEK_TEMPERATURE、DEEPSEEK_MAX_TOKENS
  */
 @Injectable()
 export class AIModelFactory {
@@ -34,32 +24,217 @@ export class AIModelFactory {
 
   constructor(private configService: ConfigService) {}
 
-  /**
-   * 创建默认的 AI 模型
-   *
-   * 这是最常用的模型初始化方法。
-   * 返回一个配置好的 ChatDeepSeek 实例。
-   *
-   * 参数都来自环境变量，这样可以根据部署环境灵活配置：
-   * - DEEPSEEK_API_KEY：API 密钥
-   * - DEEPSEEK_MODEL：模型名称（deepseek-chat 或 deepseek-reasoner）
-   * - DEEPSEEK_TEMPERATURE：温度参数（控制随机性）
-   * - DEEPSEEK_MAX_TOKENS：最大 Token 数
-   */
-  createDefaultModel(): ChatDeepSeek {
-    const apiKey = this.configService.get<string>('DEEPSEEK_API_KEY');
-    this.logger.log('DEEPSEEK_API_KEY', apiKey);
-    if (!apiKey) {
-      this.logger.warn('DEEPSEEK_API_KEY 不存在');
+  private normalizeValue(value?: string | null): string | undefined {
+    const normalized = value?.trim();
+    return normalized ? normalized : undefined;
+  }
+
+  private getRequestOverrides() {
+    return requestContextStorage.getStore()?.localLLM;
+  }
+
+  private getExplicitProvider(): LLMProvider | undefined {
+    const overrideProvider = this.normalizeValue(
+      this.getRequestOverrides()?.provider,
+    )?.toLowerCase();
+    if (
+      overrideProvider === 'mock' ||
+      overrideProvider === 'openai' ||
+      overrideProvider === 'deepseek'
+    ) {
+      return overrideProvider;
     }
 
-    // deepseek-reasoner ：思考模式（慢，适合需要深度推理的任务，如数学、逻辑题）
-    // deepseek-chat	： 非思考模式（快，适合内容生成任务，如面试问题、文案创作）
-    // ⚠️ 对于生成面试问题，使用 deepseek-chat 更快（10-30秒），reasoner 会超时（5-10分钟）
+    const provider = this.normalizeValue(
+      this.configService.get<string>('LLM_PROVIDER'),
+    )?.toLowerCase();
+    if (provider === 'mock' || provider === 'openai' || provider === 'deepseek')
+      return provider;
+    return undefined;
+  }
+
+  private getDeepSeekApiKey(): string | undefined {
+    return (
+      this.normalizeValue(this.getRequestOverrides()?.deepseekApiKey) ||
+      this.normalizeValue(this.configService.get<string>('DEEPSEEK_API_KEY'))
+    );
+  }
+
+  private getOpenAIApiKey(): string | undefined {
+    return (
+      this.normalizeValue(this.getRequestOverrides()?.openaiApiKey) ||
+      this.normalizeValue(this.configService.get<string>('OPENAI_API_KEY'))
+    );
+  }
+
+  private getDeepSeekModel(): string {
+    return (
+      this.normalizeValue(this.getRequestOverrides()?.deepseekModel) ||
+      this.normalizeValue(this.configService.get<string>('DEEPSEEK_MODEL')) ||
+      'deepseek-chat'
+    );
+  }
+
+  private getOpenAIModel(): string {
+    return (
+      this.normalizeValue(this.getRequestOverrides()?.openaiModel) ||
+      this.normalizeValue(this.configService.get<string>('OPENAI_MODEL')) ||
+      'gpt-4o-mini'
+    );
+  }
+
+  /** 当前使用的 LLM 提供商 */
+  getProvider(): LLMProvider {
+    const explicitProvider = this.getExplicitProvider();
+    if (explicitProvider) {
+      return explicitProvider;
+    }
+
+    const requestOverrides = this.getRequestOverrides();
+    const hasRequestDeepSeek = Boolean(
+      this.normalizeValue(requestOverrides?.deepseekApiKey),
+    );
+    const hasRequestOpenAI = Boolean(
+      this.normalizeValue(requestOverrides?.openaiApiKey),
+    );
+
+    if (hasRequestDeepSeek && !hasRequestOpenAI) {
+      return 'deepseek';
+    }
+    if (hasRequestOpenAI && !hasRequestDeepSeek) {
+      return 'openai';
+    }
+
+    const hasDeepSeek = Boolean(this.getDeepSeekApiKey());
+    const hasOpenAI = Boolean(this.getOpenAIApiKey());
+
+    if (hasDeepSeek && !hasOpenAI) {
+      return 'deepseek';
+    }
+    if (hasOpenAI && !hasDeepSeek) {
+      return 'openai';
+    }
+    if (!hasDeepSeek && !hasOpenAI) {
+      return 'mock';
+    }
+
+    return 'deepseek';
+  }
+
+  isMockProvider(): boolean {
+    return this.getProvider() === 'mock';
+  }
+
+  shouldFallbackToMock(error: any): boolean {
+    if (this.isMockProvider()) return true;
+
+    const isLocalEnv =
+      this.configService.get<string>('NODE_ENV') !== 'production' ||
+      this.configService.get<string>('LOCAL_DEV_MODE') === 'true';
+
+    if (!isLocalEnv) return false;
+
+    const status = error?.status || error?.response?.status;
+    const code = error?.lc_error_code || error?.code || error?.error?.code;
+    const message =
+      error?.message || error?.error?.message || error?.response?.data?.message;
+
+    return (
+      status === 401 ||
+      code === 'MODEL_AUTHENTICATION' ||
+      /authentication|api key|unauthorized|dummy-key/i.test(message || '')
+    );
+  }
+
+  /**
+   * 创建默认的 AI 模型（通用入口，返回 LangChain BaseChatModel）
+   */
+  createDefaultModel(): BaseChatModel {
+    const provider = this.getProvider();
+    if (provider === 'mock') {
+      throw new Error('LLM_PROVIDER=mock 时不应创建真实模型');
+    }
+    if (provider === 'deepseek') {
+      return this.createDeepSeekDefault();
+    }
+    return this.createOpenAIDefault();
+  }
+
+  /**
+   * 创建用于稳定输出的模型（评估、打分等）
+   */
+  createStableModel(): BaseChatModel {
+    const provider = this.getProvider();
+    if (provider === 'mock') {
+      throw new Error('LLM_PROVIDER=mock 时不应创建真实模型');
+    }
+    if (provider === 'deepseek') {
+      return this.createDeepSeekStable();
+    }
+    return this.createOpenAIStable();
+  }
+
+  /**
+   * 创建用于创意输出的模型（生成题目、文案等）
+   */
+  createCreativeModel(): BaseChatModel {
+    const provider = this.getProvider();
+    if (provider === 'mock') {
+      throw new Error('LLM_PROVIDER=mock 时不应创建真实模型');
+    }
+    if (provider === 'deepseek') {
+      return this.createDeepSeekCreative();
+    }
+    return this.createOpenAICreative();
+  }
+
+  // ---------- OpenAI (GPT) ----------
+
+  private createOpenAIDefault(): ChatOpenAI {
+    const apiKey = this.getOpenAIApiKey();
+    if (!apiKey) {
+      this.logger.warn('OPENAI_API_KEY 未配置，GPT 调用将失败');
+    }
+    return new ChatOpenAI({
+      apiKey: apiKey || 'dummy-key',
+      model: this.getOpenAIModel(),
+      temperature:
+        Number(this.configService.get<string>('OPENAI_TEMPERATURE')) || 0.7,
+      maxTokens:
+        Number(this.configService.get<string>('OPENAI_MAX_TOKENS')) || 4000,
+    });
+  }
+
+  private createOpenAIStable(): ChatOpenAI {
+    const base = this.createOpenAIDefault();
+    return new ChatOpenAI({
+      apiKey: this.getOpenAIApiKey() || 'dummy-key',
+      model: base.model,
+      temperature: 0.3,
+      maxTokens: 4000,
+    });
+  }
+
+  private createOpenAICreative(): ChatOpenAI {
+    const base = this.createOpenAIDefault();
+    return new ChatOpenAI({
+      apiKey: this.getOpenAIApiKey() || 'dummy-key',
+      model: base.model,
+      temperature: 0.8,
+      maxTokens: 4000,
+    });
+  }
+
+  // ---------- DeepSeek ----------
+
+  private createDeepSeekDefault(): ChatDeepSeek {
+    const apiKey = this.getDeepSeekApiKey();
+    if (!apiKey) {
+      this.logger.warn('DEEPSEEK_API_KEY 未配置，DeepSeek 调用将失败');
+    }
     return new ChatDeepSeek({
       apiKey: apiKey || 'dummy-key',
-      model:
-        this.configService.get<string>('DEEPSEEK_MODEL') || 'deepseek-chat',
+      model: this.getDeepSeekModel(),
       temperature:
         Number(this.configService.get<string>('DEEPSEEK_TEMPERATURE')) || 0.7,
       maxTokens:
@@ -67,34 +242,22 @@ export class AIModelFactory {
     });
   }
 
-  /**
-   * 创建用于稳定输出的模型（评估场景）
-   *
-   * 有些场景需要 AI 的输出更稳定、更一致（比如评估答案、打分）。
-   * 这个方法创建一个 temperature 较低的模型。
-   */
-  createStableModel(): ChatDeepSeek {
-    const baseModel = this.createDefaultModel();
+  private createDeepSeekStable(): ChatDeepSeek {
+    const base = this.createDeepSeekDefault();
     return new ChatDeepSeek({
-      apiKey: this.configService.get<string>('DEEPSEEK_API_KEY') || 'dummy-key',
-      model: baseModel.model,
-      temperature: 0.3, // 更低的 temperature，输出更稳定
+      apiKey: this.getDeepSeekApiKey() || 'dummy-key',
+      model: base.model,
+      temperature: 0.3,
       maxTokens: 4000,
     });
   }
 
-  /**
-   * 创建用于创意输出的模型（生成场景）
-   *
-   * 有些场景需要 AI 的输出更多样化、更有创意（比如生成题目、生成文案）。
-   * 这个方法创建一个 temperature 较高的模型。
-   */
-  createCreativeModel(): ChatDeepSeek {
-    const baseModel = this.createDefaultModel();
+  private createDeepSeekCreative(): ChatDeepSeek {
+    const base = this.createDeepSeekDefault();
     return new ChatDeepSeek({
-      apiKey: this.configService.get<string>('DEEPSEEK_API_KEY') || 'dummy-key',
-      model: baseModel.model,
-      temperature: 0.8, // 较高的 temperature，输出更多样化
+      apiKey: this.getDeepSeekApiKey() || 'dummy-key',
+      model: base.model,
+      temperature: 0.8,
       maxTokens: 4000,
     });
   }

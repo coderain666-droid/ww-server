@@ -31,7 +31,8 @@ async function bootstrap() {
   // 启用 CORS
   app.enableCors();
 
-  const port = process.env.PORT || 3000;
+  // 默认 8888，与前端 nuxt devProxy 的 target 一致，避免 /dev-api 代理连不上
+  const port = process.env.PORT || 8888;
   await app.listen(port);
   console.log(`应用启动成功，监听端口 ${port}`);
 }

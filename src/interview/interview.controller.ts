@@ -9,6 +9,7 @@ import {
   Sse,
   Param,
   Get,
+  Query,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -303,6 +304,98 @@ export class InterviewController {
     );
 
     return ResponseUtil.success(report, '查询成功');
+  }
+
+  @Get('resume/quiz/history')
+  @UseGuards(JwtAuthGuard)
+  async getResumeQuizHistory(
+    @Request() req: any,
+    @Query('page') page: number = 1,
+    @Query('limit') limit: number = 10,
+  ) {
+    const result = await this.interviewService.getResumeQuizHistory(
+      req.user.userId,
+      { page, limit },
+    );
+    return ResponseUtil.success(result, '查询成功');
+  }
+
+  @Get('resume/quiz/result/:resultId')
+  @UseGuards(JwtAuthGuard)
+  async getResumeQuizResultDetail(
+    @Param('resultId') resultId: string,
+    @Request() req: any,
+  ) {
+    const result = await this.interviewService.getResumeQuizResultDetail(
+      req.user.userId,
+      resultId,
+    );
+    return ResponseUtil.success(result, '查询成功');
+  }
+
+  @Get('special/history')
+  @UseGuards(JwtAuthGuard)
+  async getSpecialInterviewHistory(
+    @Request() req: any,
+    @Query('page') page: number = 1,
+    @Query('limit') limit: number = 10,
+  ) {
+    const result = await this.interviewService.getInterviewHistory(
+      req.user.userId,
+      'special',
+      { page, limit },
+    );
+    return ResponseUtil.success(result, '查询成功');
+  }
+
+  @Get('behavior/history')
+  @UseGuards(JwtAuthGuard)
+  async getBehaviorInterviewHistory(
+    @Request() req: any,
+    @Query('page') page: number = 1,
+    @Query('limit') limit: number = 10,
+  ) {
+    const result = await this.interviewService.getInterviewHistory(
+      req.user.userId,
+      'behavior',
+      { page, limit },
+    );
+    return ResponseUtil.success(result, '查询成功');
+  }
+
+  @Get('mock/unfinished')
+  @UseGuards(JwtAuthGuard)
+  async getUnfinishedInterviewList(@Request() req: any) {
+    const result = await this.interviewService.getUnfinishedInterviewList(
+      req.user.userId,
+    );
+    return ResponseUtil.success(result, '查询成功');
+  }
+
+  @Get('mock/result/:resultId/qa')
+  @UseGuards(JwtAuthGuard)
+  async getMockInterviewQAResult(
+    @Param('resultId') resultId: string,
+    @Request() req: any,
+  ) {
+    const result = await this.interviewService.getMockInterviewQAResult(
+      req.user.userId,
+      resultId,
+    );
+    return ResponseUtil.success(result, '查询成功');
+  }
+
+  @Get('mock/history/:resultId')
+  @UseGuards(JwtAuthGuard)
+  async getMockInterviewSessionHistory(
+    @Param('resultId') resultId: string,
+    @Request() req: any,
+  ) {
+    const result = await this.interviewService.getMockInterviewSessionHistory(
+      req.user.userId,
+      resultId,
+    );
+    return ResponseUtil.success(result, '查询成功');
   }
 
   /**

@@ -3,6 +3,7 @@ import { PromptTemplate } from '@langchain/core/prompts';
 import { AIModelFactory } from '../../ai/services/ai-model.factory';
 import { Message } from '../../ai/interfaces/message.interface';
 import { CONVERSATION_CONTINUATION_PROMPT } from '../prompts/resume-analysis.prompts';
+import { buildLocalConversationContinuation } from './local-llm-fallback';
 
 /**
  * 对话继续服务
@@ -22,6 +23,10 @@ export class ConversationContinuationService {
    * @returns AI 的回答内容
    */
   async continue(history: Message[]): Promise<string> {
+    if (this.aiModelFactory.isMockProvider()) {
+      return buildLocalConversationContinuation(history);
+    }
+
     // 第一步：创建 Prompt 模板
     const prompt = PromptTemplate.fromTemplate(
       CONVERSATION_CONTINUATION_PROMPT,
@@ -47,6 +52,10 @@ export class ConversationContinuationService {
       this.logger.log('对话继续完成');
       return aiResponse;
     } catch (error) {
+      if (this.aiModelFactory.shouldFallbackToMock(error)) {
+        this.logger.warn('真实 LLM 续聊失败，回退到本地 Mock 输出');
+        return buildLocalConversationContinuation(history);
+      }
       this.logger.error('继续对话失败:', error);
       throw error;
     }

@@ -4,6 +4,11 @@ import { Reflector } from '@nestjs/core'; // Reflector 用于从元数据中获�
 import { AuthGuard } from '@nestjs/passport'; // AuthGuard 是 Passport 的基础类，用于实现认证守卫
 import { IS_PUBLIC_KEY } from './public.decorator'; // 引入自定义的装饰器键，用于标识公开接口
 import { UnauthorizedException } from '@nestjs/common'; // UnauthorizedException 用于抛出未授权的异常
+import {
+  isMockToken,
+  getMockUserIdFromToken,
+  MOCK_USER,
+} from './mock-user.config';
 
 // 使用@Injectable装饰器，表示该类是可注入的，可以由NestJS的依赖注入系统管理
 @Injectable()
@@ -24,6 +29,22 @@ export class JwtAuthGuard extends AuthGuard('jwt') {
     // 如果接口被标记为公开接口，直接允许通过
     if (isPublic) {
       return true; // 公开接口，不需要验证Token，直接返回true
+    }
+
+    const request = context.switchToHttp().getRequest<Request & { user?: any }>();
+    const authHeader = request.headers?.['authorization'];
+    // 本地 Mock：前端带 Bearer mock 或 Bearer mock:userId 时直接视为已登录
+    if (isMockToken(authHeader)) {
+      const mockUserId = getMockUserIdFromToken(authHeader);
+      const allowedId = MOCK_USER.userId;
+      if (mockUserId === allowedId || !mockUserId) {
+        request.user = {
+          userId: MOCK_USER.userId,
+          username: MOCK_USER.username,
+          email: MOCK_USER.email,
+        };
+        return true;
+      }
     }
 
     // 否则，执行父类AuthGuard的canActivate方法，进行JWT认证

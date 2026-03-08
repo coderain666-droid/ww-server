@@ -1,0 +1,14 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: wwzhidao-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: wwzhidao
+    volumes:
+      - wwzhidao-mongo-data:/data/db
+
+volumes:
+  wwzhidao-mongo-data:

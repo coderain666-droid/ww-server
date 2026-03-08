@@ -2,10 +2,49 @@ import { Injectable, NestMiddleware, Logger } from '@nestjs/common';
 import { Request, Response, NextFunction } from 'express';
 import { v4 as uuid } from 'uuid';
 import { AsyncLocalStorage } from 'async_hooks';
+import {
+  requestContextStorage,
+  type LocalLLMRequestOverrides,
+} from '../request-context/request-context';
 
 // 使用 AsyncLocalStorage 来存储 TraceID
 // 这样任何地方都能访问到它，而不用传参
 export const traceIdStorage = new AsyncLocalStorage<string>();
+
+const normalizeHeaderValue = (
+  value: string | string[] | undefined,
+): string | undefined => {
+  if (Array.isArray(value)) {
+    return normalizeHeaderValue(value[0]);
+  }
+  const normalized = value?.trim();
+  return normalized ? normalized : undefined;
+};
+
+const extractLocalLLMOverrides = (req: Request): LocalLLMRequestOverrides => {
+  const provider = normalizeHeaderValue(req.headers['x-local-llm-provider']);
+  const deepseekApiKey = normalizeHeaderValue(
+    req.headers['x-local-deepseek-api-key'],
+  );
+  const openaiApiKey = normalizeHeaderValue(
+    req.headers['x-local-openai-api-key'],
+  );
+  const deepseekModel = normalizeHeaderValue(
+    req.headers['x-local-deepseek-model'],
+  );
+  const openaiModel = normalizeHeaderValue(req.headers['x-local-openai-model']);
+
+  return {
+    provider:
+      provider === 'openai' || provider === 'deepseek' || provider === 'mock'
+        ? provider
+        : undefined,
+    deepseekApiKey,
+    openaiApiKey,
+    deepseekModel,
+    openaiModel,
+  };
+};
 
 @Injectable()
 export class TraceIdMiddleware implements NestMiddleware {
@@ -17,21 +56,25 @@ export class TraceIdMiddleware implements NestMiddleware {
 
     // 将 TraceID 存储在 AsyncLocalStorage 中
     // 这样 Service 中就能访问到它
+    const localLLM = extractLocalLLMOverrides(req);
+
     traceIdStorage.run(traceId, () => {
-      // 将 TraceID 加到响应头中，前端可以看到
-      res.setHeader('x-trace-id', traceId);
+      requestContextStorage.run({ localLLM }, () => {
+        // 将 TraceID 加到响应头中，前端可以看到
+        res.setHeader('x-trace-id', traceId);
 
-      // 记录请求开始
-      this.logger.log(`[${traceId}] 请求开始: ${req.method} ${req.url}`);
+        // 记录请求开始
+        this.logger.log(`[${traceId}] 请求开始: ${req.method} ${req.url}`);
 
-      // 监听响应完成
-      res.on('finish', () => {
-        this.logger.log(
-          `[${traceId}] 请求结束: ${req.method} ${req.url} - 状态码: ${res.statusCode}`,
-        );
+        // 监听响应完成
+        res.on('finish', () => {
+          this.logger.log(
+            `[${traceId}] 请求结束: ${req.method} ${req.url} - 状态码: ${res.statusCode}`,
+          );
+        });
+
+        next();
       });
-
-      next();
     });
   }
 }

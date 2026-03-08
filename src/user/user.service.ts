@@ -16,6 +16,14 @@ import {
   UserConsumptionDocument,
 } from './schemas/consumption-record.schema';
 import { UpdateUserDto } from './dto/update-user.dto';
+import {
+  isMockUserId,
+  getMockUserSnapshot,
+} from '../auth/mock-user.config';
+import {
+  UserTransaction,
+  UserTransactionDocument,
+} from './schemas/user-transaction.schema';
 
 @Injectable()
 export class UserService {
@@ -25,6 +33,8 @@ export class UserService {
     private consumptionRecordModel: Model<ConsumptionRecordDocument>,
     @InjectModel(UserConsumption.name)
     private consumptionModel: Model<UserConsumptionDocument>,
+    @InjectModel(UserTransaction.name)
+    private userTransactionModel: Model<UserTransactionDocument>,
     private jwtService: JwtService,
   ) {}
 
@@ -91,8 +101,12 @@ export class UserService {
 
   /**
    * 获取用户信息
+   * 本地 Mock 用户不查库，直接返回写死数据
    */
   async getUserInfo(userId: string) {
+    if (isMockUserId(userId)) {
+      return getMockUserSnapshot();
+    }
     const user = await this.userModel.findById(userId).lean();
     if (!user) {
       throw new NotFoundException('用户不存在');
@@ -104,6 +118,9 @@ export class UserService {
   }
 
   async updateUser(userId: string, updateUserDto: UpdateUserDto) {
+    if (isMockUserId(userId)) {
+      return getMockUserSnapshot();
+    }
     // 如果更新邮箱，检查邮箱是否已被使用
     if (updateUserDto.email) {
       const existingUser = await this.userModel.findOne({
@@ -155,10 +172,13 @@ export class UserService {
    * @param options - 可选的查询参数，包括跳过的记录数和限制的记录数
    * @returns - 返回用户的消费记录和消费统计数据
    */
-  async getUserConsumptionRecords(
+  async   getUserConsumptionRecords(
     userId: string, // 用户ID，用于标识和查询特定用户的消费记录
     options?: { skip: number; limit: number }, // 查询选项，包含跳过记录的数量和每次查询的记录数量
   ) {
+    if (isMockUserId(userId)) {
+      return { records: [], stats: [] };
+    }
     // 如果没有传递查询选项，则默认跳过0条记录，并限制返回20条记录
     const skip = options?.skip || 0; // 从第skip条记录开始
     const limit = options?.limit || 20; // 限制返回的记录数量，默认是20
@@ -195,5 +215,33 @@ export class UserService {
       records, // 用户的消费记录
       stats, // 按消费类型分组后的统计信息
     };
+  }
+
+  async getUserTransactions(
+    userId: string,
+    options?: { skip: number; limit: number },
+  ) {
+    if (isMockUserId(userId)) {
+      return [];
+    }
+
+    const skip = options?.skip || 0;
+    const limit = options?.limit || 20;
+
+    const records = await this.userTransactionModel
+      .find({ userIdentifier: userId })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean();
+
+    return records.map((record: any) => ({
+      ...record,
+      recordId: record._id?.toString?.() || record.recordId,
+      outTradeNo:
+        record.payData?.outTradeNo || record.relatedOrderId || record.outTradeNo,
+      paidAt: record.payData?.paidAt || record.createdAt,
+      channel: record.payData?.channel || record.source || '',
+    }));
   }
 }

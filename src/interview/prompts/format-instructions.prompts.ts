@@ -1,7 +1,12 @@
 /**
- * 仅押题部分的格式说明
+ * 仅押题部分的格式说明（问题数量可配置）
  */
-export const FORMAT_INSTRUCTIONS_QUESTIONS_ONLY = `
+export const DEFAULT_RESUME_QUIZ_QUESTION_COUNT = 10;
+
+export function getFormatInstructionsQuestionsOnly(questionCount: number): string {
+  // 限制在 [6, 16]：min 保证至少 6 题，max 保证最多 16 题
+  const n = Math.max(6, Math.min(16, Math.round(questionCount)));
+  return `
 请严格按照以下JSON格式返回结果：
 
 {
@@ -21,7 +26,7 @@ export const FORMAT_INSTRUCTIONS_QUESTIONS_ONLY = `
 
 ⚠️ 注意事项：
 1. 确保返回有效的JSON格式，不要包含注释
-2. questions数组长度为3-5
+2. questions 数组必须包含恰好 ${n} 个问题，不能少
 3. 每个答案200-300字
 4. summary 150-200字
 5. 不要包含任何JSON之外的文本
@@ -32,6 +37,7 @@ export const FORMAT_INSTRUCTIONS_QUESTIONS_ONLY = `
    - 制表符使用 \\t
 7. 所有文本内容都应该是单行字符串，段落之间用 \\n 分隔
 `;
+}
 
 /**
  * 仅匹配度分析的格式说明

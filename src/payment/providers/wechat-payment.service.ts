@@ -3,6 +3,7 @@ import {
   Injectable,
   Logger,
   InternalServerErrorException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
@@ -25,7 +26,8 @@ export class WechatPaymentService {
   private readonly privateKey: string;
   private readonly apiBaseUrl: string;
   private readonly apiV3Key?: string;
-  private readonly httpClient: AxiosInstance;
+  private readonly httpClient?: AxiosInstance;
+  private readonly enabled: boolean;
 
   constructor(private readonly configService: ConfigService) {
     // 服务号的 app id
@@ -66,15 +68,15 @@ export class WechatPaymentService {
       this.configService.get<string>('WECHAT_PAY_API_BASE') ||
       'https://api.mch.weixin.qq.com';
 
-    if (
-      !this.appId ||
-      !this.mchId ||
-      !this.merchantSerial ||
-      !this.privateKey
-    ) {
-      throw new InternalServerErrorException(
-        '微信支付配置缺失，请检查 APP_ID/MCH_ID/MCH_SERIAL/PRIVATE_KEY',
+    this.enabled = Boolean(
+      this.appId && this.mchId && this.merchantSerial && this.privateKey,
+    );
+
+    if (!this.enabled) {
+      this.logger.warn(
+        '微信支付配置缺失，已禁用本地支付能力；不影响 AI 面试主流程',
       );
+      return;
     }
 
     try {
@@ -104,6 +106,8 @@ export class WechatPaymentService {
   async initiatePayment(
     payload: PaymentOrderPayload,
   ): Promise<PaymentInitiationResult> {
+    const httpClient = this.getHttpClient();
+
     const path = '/v3/pay/transactions/native';
     const timestamp = Math.floor(Date.now() / 1000).toString();
     const nonceStr = crypto.randomBytes(16).toString('hex');
@@ -127,7 +131,7 @@ export class WechatPaymentService {
     );
 
     try {
-      const response = await this.httpClient.post(path, bodyString, {
+      const response = await httpClient.post(path, bodyString, {
         headers: {
           Authorization: authorization,
           Accept: 'application/json',
@@ -220,6 +224,8 @@ export class WechatPaymentService {
    * @returns
    */
   async queryTrade(orderId: string): Promise<Record<string, any>> {
+    const httpClient = this.getHttpClient();
+
     if (!orderId) {
       throw new BadRequestException('orderId 不能为空');
     }
@@ -238,7 +244,7 @@ export class WechatPaymentService {
     );
 
     try {
-      const response = await this.httpClient.get(path, {
+      const response = await httpClient.get(path, {
         headers: {
           Authorization: authorization,
           Accept: 'application/json',
@@ -252,5 +258,15 @@ export class WechatPaymentService {
       });
       throw error;
     }
+  }
+
+  private getHttpClient(): AxiosInstance {
+    if (!this.httpClient) {
+      throw new ServiceUnavailableException(
+        '微信支付未配置，本地模式下请忽略支付能力',
+      );
+    }
+
+    return this.httpClient;
   }
 }
